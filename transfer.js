@@ -5,6 +5,8 @@ require('dotenv').config();
 const AWS = require('aws-sdk');
 const https = require('https');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 // Configuration
 const API_VIDEO_KEY = process.env.API_VIDEO_KEY;
@@ -32,13 +34,47 @@ const s3 = new AWS.S3({
   s3ForcePathStyle: false,
 });
 
-// Fetch videos list using curl
-async function fetchVideoList() {
+// Retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 5000; // 5 seconds between retries
+
+// Failed videos log file
+const FAILED_LOG_FILE = path.join(__dirname, 'failed-videos.json');
+
+// Fetch all videos with pagination
+async function fetchAllVideos() {
+  const allVideos = [];
+  let currentPage = 1;
+  let hasMorePages = true;
+  
+  console.log('Fetching all videos from api.video...\n');
+  
+  while (hasMorePages) {
+    console.log(`  Fetching page ${currentPage}...`);
+    
+    const pageData = await fetchVideoPage(currentPage);
+    
+    if (pageData && pageData.length > 0) {
+      allVideos.push(...pageData);
+      currentPage++;
+      // Continue if we got a full page (assume page size is 100)
+      hasMorePages = pageData.length === 100;
+    } else {
+      hasMorePages = false;
+    }
+  }
+  
+  console.log(`  Total videos found: ${allVideos.length}\n`);
+  return allVideos;
+}
+
+// Fetch single page of videos
+async function fetchVideoPage(page) {
   return new Promise((resolve, reject) => {
     const curl = spawn('curl', [
       '-s',
       '-H', `Authorization: Bearer ${API_VIDEO_KEY}`,
-      'https://ws.api.video/videos?currentPage=1&pageSize=100'
+      `https://ws.api.video/videos?currentPage=${page}&pageSize=100`
     ]);
     
     let data = '';
@@ -94,6 +130,26 @@ async function fetchVideoDetails(videoId) {
   });
 }
 
+// Stream video directly from URL to S3 with retry logic
+async function streamToS3WithRetry(sourceUrl, s3Key, videoTitle, retries = 0) {
+  try {
+    await streamToS3(sourceUrl, s3Key, videoTitle);
+    return { success: true };
+  } catch (error) {
+    if (retries < MAX_RETRIES) {
+      console.log(`  🔄 Retrying (${retries + 1}/${MAX_RETRIES})...`);
+      await delay(RETRY_DELAY);
+      return streamToS3WithRetry(sourceUrl, s3Key, videoTitle, retries + 1);
+    } else {
+      return { success: false, error: error.message };
+    }
+  }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // Stream video directly from URL to S3 (no temp storage)
 async function streamToS3(sourceUrl, s3Key, videoTitle) {
   return new Promise((resolve, reject) => {
@@ -143,50 +199,143 @@ async function streamToS3(sourceUrl, s3Key, videoTitle) {
   });
 }
 
-async function transferVideos() {
-  try {
-    console.log('Fetching videos from api.video...\n');
-    
-    const videos = await fetchVideoList();
-    
-    console.log(`Found ${videos.length} videos to transfer\n`);
+// Load failed videos from previous run
+function loadFailedVideos() {
+  if (fs.existsSync(FAILED_LOG_FILE)) {
+    try {
+      const data = fs.readFileSync(FAILED_LOG_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (err) {
+      console.log('Warning: Could not load failed videos log, starting fresh');
+      return [];
+    }
+  }
+  return [];
+}
 
-    for (let i = 0; i < videos.length; i++) {
-      const video = videos[i];
-      console.log(`[${i + 1}/${videos.length}] Processing: ${video.title || video.videoId}`);
+// Save failed videos for retry later
+function saveFailedVideos(failedVideos) {
+  fs.writeFileSync(FAILED_LOG_FILE, JSON.stringify(failedVideos, null, 2));
+  console.log(`\n📄 Saved ${failedVideos.length} failed videos to ${FAILED_LOG_FILE}`);
+  console.log('   Run with --retry flag to retry failed transfers\n');
+}
+
+// Clear failed videos log
+function clearFailedLog() {
+  if (fs.existsSync(FAILED_LOG_FILE)) {
+    fs.unlinkSync(FAILED_LOG_FILE);
+    console.log('Cleared failed videos log\n');
+  }
+}
+
+async function transferVideos(videosToProcess) {
+  const failedVideos = [];
+  
+  console.log(`Processing ${videosToProcess.length} videos...\n`);
+
+  for (let i = 0; i < videosToProcess.length; i++) {
+    const video = videosToProcess[i];
+    console.log(`[${i + 1}/${videosToProcess.length}] Processing: ${video.title || video.videoId}`);
+    
+    try {
+      // Get video details with source URL
+      const videoDetails = await fetchVideoDetails(video.videoId);
+      const sourceUrl = videoDetails.assets?.mp4;
       
-      try {
-        // Get video details with source URL
-        const videoDetails = await fetchVideoDetails(video.videoId);
-        const sourceUrl = videoDetails.assets?.mp4;
-        
-        if (!sourceUrl) {
-          console.log(`  ⚠️ No MP4 source available for video ${video.videoId}\n`);
-          continue;
-        }
+      if (!sourceUrl) {
+        console.log(`  ⚠️ No MP4 source available for video ${video.videoId}\n`);
+        continue;
+      }
 
-        // Sanitize title for use as filename
-        const sanitizeFilename = (title) => {
-          return title
-            .replace(/[^a-zA-Z0-9\-\s.]/g, '') // Remove special chars except dash, space, dot
-            .replace(/\s+/g, ' ') // Collapse multiple spaces
-            .trim() || video.videoId; // Fallback to videoId if empty
-        };
-        
-        const safeTitle = sanitizeFilename(video.title || video.videoId);
-        const s3Key = `api-video-backup/${safeTitle} - ${video.videoId}`;
+      // Sanitize title for use as filename
+      const sanitizeFilename = (title) => {
+        return title
+          .replace(/[^a-zA-Z0-9\-\s.]/g, '') // Remove special chars except dash, space, dot
+          .replace(/\s+/g, ' ') // Collapse multiple spaces
+          .trim() || video.videoId; // Fallback to videoId if empty
+      };
+      
+      const safeTitle = sanitizeFilename(video.title || video.videoId);
+      const s3Key = `api-video-backup/${safeTitle} - ${video.videoId}`;
 
-        // Stream directly from URL to S3 (no temp storage!)
-        await streamToS3(sourceUrl, s3Key, video.title);
-
+      // Stream directly from URL to S3 with retry
+      const result = await streamToS3WithRetry(sourceUrl, s3Key, video.title);
+      
+      if (result.success) {
         console.log(`  ✅ Successfully transferred\n`);
-      } catch (error) {
-        console.error(`  ❌ Failed to transfer video ${video.videoId}:`, error.message);
+      } else {
+        console.error(`  ❌ Failed after ${MAX_RETRIES} retries: ${result.error}`);
+        failedVideos.push({
+          videoId: video.videoId,
+          title: video.title,
+          error: result.error,
+          timestamp: new Date().toISOString()
+        });
         console.log('');
       }
+    } catch (error) {
+      console.error(`  ❌ Failed to process video ${video.videoId}:`, error.message);
+      failedVideos.push({
+        videoId: video.videoId,
+        title: video.title,
+        error: error.message,
+        timestamp: new Date().toISOString()
+      });
+      console.log('');
     }
+  }
 
-    console.log('\nTransfer complete!');
+  return failedVideos;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const retryMode = args.includes('--retry');
+  const retryFailed = args.includes('--retry-failed');
+  
+  try {
+    if (retryMode || retryFailed) {
+      // Retry only failed videos from previous run
+      const failedVideos = loadFailedVideos();
+      
+      if (failedVideos.length === 0) {
+        console.log('No failed videos to retry.\n');
+        return;
+      }
+      
+      console.log(`🔄 Retrying ${failedVideos.length} failed videos...\n`);
+      
+      // Convert back to the format expected by transferVideos
+      const videosToRetry = failedVideos.map(v => ({
+        videoId: v.videoId,
+        title: v.title
+      }));
+      
+      const stillFailed = await transferVideos(videosToRetry);
+      
+      if (stillFailed.length === 0) {
+        console.log('\n🎉 All videos successfully transferred!');
+        clearFailedLog();
+      } else {
+        console.log(`\n⚠️ ${stillFailed.length} videos still failed`);
+        saveFailedVideos(stillFailed);
+      }
+      
+    } else {
+      // Normal mode: process all videos
+      const videos = await fetchAllVideos();
+      
+      const failedVideos = await transferVideos(videos);
+      
+      if (failedVideos.length === 0) {
+        console.log('\n🎉 Transfer complete! All videos transferred successfully!');
+        clearFailedLog();
+      } else {
+        console.log(`\n⚠️ Transfer complete with ${failedVideos.length} failures`);
+        saveFailedVideos(failedVideos);
+        console.log('\nTo retry failed videos, run: npm run transfer -- --retry');
+      }
+    }
     
   } catch (error) {
     console.error('Error:', error.message);
@@ -195,4 +344,4 @@ async function transferVideos() {
 }
 
 // Run the transfer
-transferVideos();
+main();
