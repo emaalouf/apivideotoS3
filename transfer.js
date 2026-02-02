@@ -165,7 +165,16 @@ async function transferVideos() {
           continue;
         }
 
-        const s3Key = `api-video-backup/${video.videoId}.mp4`;
+        // Sanitize title for use as filename
+        const sanitizeFilename = (title) => {
+          return title
+            .replace(/[^a-zA-Z0-9\-\s.]/g, '') // Remove special chars except dash, space, dot
+            .replace(/\s+/g, ' ') // Collapse multiple spaces
+            .trim() || video.videoId; // Fallback to videoId if empty
+        };
+        
+        const safeTitle = sanitizeFilename(video.title || video.videoId);
+        const s3Key = `api-video-backup/${safeTitle}.mp4`;
 
         // Stream directly from URL to S3 (no temp storage!)
         await streamToS3(sourceUrl, s3Key, video.title);
