@@ -2,12 +2,9 @@
 
 require('dotenv').config();
 
-const { ApiVideoClient } = require('@api.video/nodejs-client');
 const AWS = require('aws-sdk');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const { pipeline } = require('stream/promises');
+const { spawn } = require('child_process');
 
 // Configuration
 const API_VIDEO_KEY = process.env.API_VIDEO_KEY;
@@ -27,9 +24,6 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// Initialize clients
-const apiVideoClient = new ApiVideoClient({ apiKey: API_VIDEO_KEY });
-
 const s3 = new AWS.S3({
   endpoint: `https://${DO_SPACES_REGION}.digitaloceanspaces.com`,
   accessKeyId: DO_SPACES_KEY,
@@ -38,49 +32,122 @@ const s3 = new AWS.S3({
   s3ForcePathStyle: false,
 });
 
-// Create temp directory
-const TEMP_DIR = path.join(__dirname, 'temp');
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
+// Fetch videos list using curl
+async function fetchVideoList() {
+  return new Promise((resolve, reject) => {
+    const curl = spawn('curl', [
+      '-s',
+      '-H', `Authorization: Bearer ${API_VIDEO_KEY}`,
+      'https://ws.api.video/videos?currentPage=1&pageSize=100'
+    ]);
+    
+    let data = '';
+    curl.stdout.on('data', (chunk) => {
+      data += chunk;
+    });
+    
+    curl.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`curl exited with code ${code}`));
+        return;
+      }
+      try {
+        const response = JSON.parse(data);
+        resolve(response.data);
+      } catch (err) {
+        reject(new Error(`Failed to parse JSON: ${err.message}`));
+      }
+    });
+    
+    curl.on('error', reject);
+  });
 }
 
-async function downloadFile(url, filePath) {
+// Fetch single video details using curl
+async function fetchVideoDetails(videoId) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filePath);
-    https.get(url, (response) => {
+    const curl = spawn('curl', [
+      '-s',
+      '-H', `Authorization: Bearer ${API_VIDEO_KEY}`,
+      `https://ws.api.video/videos/${videoId}`
+    ]);
+    
+    let data = '';
+    curl.stdout.on('data', (chunk) => {
+      data += chunk;
+    });
+    
+    curl.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`curl exited with code ${code}`));
+        return;
+      }
+      try {
+        const response = JSON.parse(data);
+        resolve(response);
+      } catch (err) {
+        reject(new Error(`Failed to parse JSON: ${err.message}`));
+      }
+    });
+    
+    curl.on('error', reject);
+  });
+}
+
+// Stream video directly from URL to S3 (no temp storage)
+async function streamToS3(sourceUrl, s3Key, videoTitle) {
+  return new Promise((resolve, reject) => {
+    console.log(`  📤 Starting stream to S3...`);
+    
+    https.get(sourceUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Node.js Transfer Script)'
+      }
+    }, (response) => {
       if (response.statusCode !== 200) {
         reject(new Error(`Failed to download: ${response.statusCode}`));
         return;
       }
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        resolve();
+      
+      const contentLength = response.headers['content-length'];
+      const sizeMB = contentLength ? (parseInt(contentLength) / 1024 / 1024).toFixed(2) : 'unknown';
+      console.log(`  📦 Size: ${sizeMB} MB`);
+      
+      // Stream directly to S3 using multipart upload
+      const uploadParams = {
+        Bucket: DO_SPACES_BUCKET,
+        Key: s3Key,
+        Body: response,
+        ContentType: 'video/mp4',
+        ACL: 'private',
+        StorageClass: 'STANDARD',
+      };
+      
+      if (contentLength) {
+        uploadParams.ContentLength = parseInt(contentLength);
+      }
+      
+      s3.upload(uploadParams, {
+        partSize: 10 * 1024 * 1024, // 10MB chunks
+        queueSize: 1 // Process one chunk at a time (low memory)
+      }, (err, data) => {
+        if (err) {
+          reject(err);
+        } else {
+          console.log(`  ✅ Uploaded to: ${data.Location || s3Key}`);
+          resolve(data);
+        }
       });
+      
     }).on('error', reject);
   });
 }
 
-async function uploadToSpaces(filePath, key) {
-  const fileContent = fs.readFileSync(filePath);
-  
-  const params = {
-    Bucket: DO_SPACES_BUCKET,
-    Key: key,
-    Body: fileContent,
-    ACL: 'private',
-    StorageClass: 'STANDARD', // Change to 'GLACIER' for cold storage
-  };
-
-  await s3.upload(params).promise();
-}
-
 async function transferVideos() {
   try {
-    console.log('Fetching videos from api.video...');
+    console.log('Fetching videos from api.video...\n');
     
-    const videosResponse = await apiVideoClient.videos.list({});
-    const videos = videosResponse.data;
+    const videos = await fetchVideoList();
     
     console.log(`Found ${videos.length} videos to transfer\n`);
 
@@ -89,41 +156,28 @@ async function transferVideos() {
       console.log(`[${i + 1}/${videos.length}] Processing: ${video.title || video.videoId}`);
       
       try {
-        // Get video source URL
-        const videoResponse = await apiVideoClient.videos.get(video.videoId);
-        const sourceUrl = videoResponse.assets?.mp4;
+        // Get video details with source URL
+        const videoDetails = await fetchVideoDetails(video.videoId);
+        const sourceUrl = videoDetails.assets?.mp4;
         
         if (!sourceUrl) {
-          console.log(`  ⚠️ No MP4 source available for video ${video.videoId}`);
+          console.log(`  ⚠️ No MP4 source available for video ${video.videoId}\n`);
           continue;
         }
 
-        const tempFile = path.join(TEMP_DIR, `${video.videoId}.mp4`);
         const s3Key = `api-video-backup/${video.videoId}.mp4`;
 
-        // Download video
-        console.log(`  📥 Downloading...`);
-        await downloadFile(sourceUrl, tempFile);
-        const stats = fs.statSync(tempFile);
-        console.log(`  📦 Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-
-        // Upload to Digital Ocean
-        console.log(`  ☁️ Uploading to Digital Ocean Spaces...`);
-        await uploadToSpaces(tempFile, s3Key);
-
-        // Clean up temp file
-        fs.unlinkSync(tempFile);
+        // Stream directly from URL to S3 (no temp storage!)
+        await streamToS3(sourceUrl, s3Key, video.title);
 
         console.log(`  ✅ Successfully transferred\n`);
       } catch (error) {
         console.error(`  ❌ Failed to transfer video ${video.videoId}:`, error.message);
+        console.log('');
       }
     }
 
     console.log('\nTransfer complete!');
-    
-    // Clean up temp directory
-    fs.rmSync(TEMP_DIR, { recursive: true, force: true });
     
   } catch (error) {
     console.error('Error:', error.message);

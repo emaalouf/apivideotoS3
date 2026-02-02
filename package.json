@@ -12,7 +12,6 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@api.video/nodejs-client": "^2.6.8",
     "aws-sdk": "^2.1693.0",
     "dotenv": "^16.4.5"
   }
