@@ -228,6 +228,25 @@ function clearFailedLog() {
   }
 }
 
+// Check if file already exists in S3
+async function checkFileExists(s3Key) {
+  return new Promise((resolve) => {
+    s3.headObject({
+      Bucket: DO_SPACES_BUCKET,
+      Key: s3Key
+    }, (err) => {
+      if (err && err.code === 'NotFound') {
+        resolve(false);
+      } else if (err) {
+        // Some other error, assume doesn't exist to be safe
+        resolve(false);
+      } else {
+        resolve(true);
+      }
+    });
+  });
+}
+
 async function transferVideos(videosToProcess) {
   const failedVideos = [];
   
@@ -257,6 +276,13 @@ async function transferVideos(videosToProcess) {
       
       const safeTitle = sanitizeFilename(video.title || video.videoId);
       const s3Key = `api-video-backup/${safeTitle} - ${video.videoId}`;
+
+      // Check if file already exists in S3
+      const exists = await checkFileExists(s3Key);
+      if (exists) {
+        console.log(`  ⏭️  Already exists in S3, skipping\n`);
+        continue;
+      }
 
       // Stream directly from URL to S3 with retry
       const result = await streamToS3WithRetry(sourceUrl, s3Key, video.title);
