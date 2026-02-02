@@ -174,7 +174,7 @@ async function transferVideos() {
         };
         
         const safeTitle = sanitizeFilename(video.title || video.videoId);
-        const s3Key = `api-video-backup/${safeTitle}.mp4`;
+        const s3Key = `api-video-backup/${safeTitle} - ${video.videoId}`;
 
         // Stream directly from URL to S3 (no temp storage!)
         await streamToS3(sourceUrl, s3Key, video.title);
