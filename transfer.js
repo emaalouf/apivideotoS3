@@ -314,12 +314,123 @@ async function transferVideos(videosToProcess) {
   return failedVideos;
 }
 
+// List all objects in S3 bucket with given prefix
+async function listS3Objects(prefix) {
+  return new Promise((resolve, reject) => {
+    const objects = [];
+    const listObjects = (marker) => {
+      const params = {
+        Bucket: DO_SPACES_BUCKET,
+        Prefix: prefix,
+        MaxKeys: 1000
+      };
+      if (marker) params.Marker = marker;
+      
+      s3.listObjects(params, (err, data) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        
+        objects.push(...data.Contents);
+        
+        if (data.IsTruncated) {
+          // More objects to fetch
+          listObjects(data.Contents[data.Contents.length - 1].Key);
+        } else {
+          resolve(objects);
+        }
+      });
+    };
+    
+    listObjects();
+  });
+}
+
+// Verify transfer - check which videos are missing from S3
+async function verifyTransfer() {
+  console.log('🔍 Verifying transfer...\n');
+  
+  // Get all videos from api.video
+  const allVideos = await fetchAllVideos();
+  console.log(`Found ${allVideos.length} videos in api.video\n`);
+  
+  // Get all files from S3
+  console.log('Listing files in S3...');
+  const s3Objects = await listS3Objects('api-video-backup/');
+  console.log(`Found ${s3Objects.length} files in S3\n`);
+  
+  // Create a map of S3 keys
+  const s3Keys = new Set(s3Objects.map(obj => obj.Key));
+  
+  // Check each video
+  const missingVideos = [];
+  const sizeMismatch = [];
+  
+  for (const video of allVideos) {
+    const sanitizeFilename = (title) => {
+      return title
+        .replace(/[^a-zA-Z0-9\-\s.]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim() || video.videoId;
+    };
+    
+    const safeTitle = sanitizeFilename(video.title || video.videoId);
+    const expectedKey = `api-video-backup/${safeTitle} - ${video.videoId}`;
+    
+    if (!s3Keys.has(expectedKey)) {
+      missingVideos.push({
+        videoId: video.videoId,
+        title: video.title,
+        expectedKey
+      });
+    }
+  }
+  
+  // Report results
+  console.log('\n📊 Verification Results:');
+  console.log('========================');
+  console.log(`Total videos in api.video: ${allVideos.length}`);
+  console.log(`Total files in S3: ${s3Objects.length}`);
+  console.log(`Missing from S3: ${missingVideos.length}`);
+  
+  if (missingVideos.length > 0) {
+    console.log('\n❌ Missing Videos:');
+    missingVideos.forEach((v, i) => {
+      console.log(`  ${i + 1}. ${v.title || 'Untitled'} (${v.videoId})`);
+    });
+    
+    // Save missing videos for retry
+    const missingForRetry = missingVideos.map(v => ({
+      videoId: v.videoId,
+      title: v.title,
+      error: 'Missing from S3 after verification',
+      timestamp: new Date().toISOString()
+    }));
+    
+    fs.writeFileSync(FAILED_LOG_FILE, JSON.stringify(missingForRetry, null, 2));
+    console.log(`\n📄 Saved ${missingVideos.length} missing videos to ${FAILED_LOG_FILE}`);
+    console.log('   Run with --retry flag to transfer missing videos\n');
+  } else {
+    console.log('\n✅ All videos verified! Nothing missing from S3.');
+    clearFailedLog();
+  }
+  
+  return missingVideos;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const retryMode = args.includes('--retry');
   const retryFailed = args.includes('--retry-failed');
+  const verifyMode = args.includes('--verify');
   
   try {
+    if (verifyMode) {
+      await verifyTransfer();
+      return;
+    }
+    
     if (retryMode || retryFailed) {
       // Retry only failed videos from previous run
       const failedVideos = loadFailedVideos();
